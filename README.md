@@ -2,8 +2,6 @@
 
 A small .NET service that reads every inventory record from the Inventory API (which is paginated and not always well behaved), aggregates them by category, and exposes the result over HTTP.
 
-> **Status:** work in progress. The API client, the aggregation logic and the endpoint are done. Tests are still to come, and the sections marked _TODO_ will be filled in as they're built.
-
 ## Requirements
 
 - Windows, macOS or Linux
@@ -82,27 +80,59 @@ If the Inventory API can't be reached, keeps failing after retries, or returns d
   "type": "https://tools.ietf.org/html/rfc9110#section-15.6.3",
   "title": "Inventory data is unavailable",
   "status": 502,
-  "detail": "The upstream inventory service failed or returned incomplete data. Please try again later."
+  "detail": "The upstream inventory service failed or returned incomplete data. Please try again later.",
+  "traceId": "00-21dee02ad5b0cee7a08828cb47d26ca7-b0125ee9ee5ceca9-00"
 }
 ```
 
-The caller gets a generic message. The specific cause (for example, "returned 429 on page 6 after 4 attempts") is written to the server log, so internal details aren't exposed.
+The caller gets a generic message. The specific cause (for example, "returned 429 on page 6 after 4 attempts") is written to the server log, so internal details aren't exposed. The `traceId` in the response also appears on the server's log entries for that request, so a reported error can be matched to its log line.
+
+This was verified by setting an invalid API key: the endpoint returned the `502` above, and the log recorded `The inventory API returned 401 on page 1.`
 
 `502` was chosen because the problem lies with the service we depend on, not with the caller's request or our own code. Any other unexpected error returns a plain `500` problem response with no stack trace.
 
 ## Running the tests
 
-_TODO_
+```
+dotnet test
+```
+
+There are 37 tests. They need no network access and no API key, because the HTTP layer and the clock are replaced with test doubles.
+
+| Test class | What it covers |
+|---|---|
+| `InventoryAggregatorTests` | The aggregation rules: zero and negative quantities excluded, totals, counts, category grouping across different spellings, display-name choice and its tie-break, most recently updated record and its tie-break, ordering, the `Uncategorized` fallback |
+| `InventoryApiClientTests` | The client's resilience: reading every page, retrying 429 while honouring `Retry-After`, retrying 408 and 5xx, exponential backoff timings, giving up after 4 attempts, not retrying 400/401/403/404, retrying network errors, stopping when the caller cancels, malformed JSON, duplicate handling, missing records, `totalRecords` changing between pages |
+| `InventoryEndpointsTests` | The endpoint returns `200` with aggregated data, and returns `502` without exposing the internal error message |
+
+Two test doubles in `tests/InventoryService.Tests/TestDoubles/` make this possible:
+
+- **`FakeHttpMessageHandler`** replaces the network. Each test queues the responses it wants (for example, a 429 followed by a good page) and then checks which requests were sent.
+- **`InstantTimeProvider`** is a clock on which every wait finishes immediately, but it records how long the client asked to wait. Retry tests run instantly and can still check the backoff and `Retry-After` delays.
 
 ## Architecture
 
-_TODO: full write-up once all the pieces exist._ So far:
+A request to `GET /api/inventory/categories` flows like this:
+
+```
+Endpoint  ──►  IInventoryApiClient  ──►  Inventory API (all pages, with retries)
+   │                 │
+   │                 └─ returns a complete, de-duplicated list of records
+   │
+   └──────►  IInventoryAggregator  ──►  category summaries  ──►  200 JSON
+                                  (any InventoryApiException  ──►  502 JSON)
+```
+
+The code is split into three parts. Each one has a single job and can be tested without the others:
 
 - **`Models/`**: immutable `record` types for an inventory record and for one page of API results.
 - **`Clients/`**: `IInventoryApiClient` and its implementation. This is the only code that knows HTTP exists. It fetches every page, retries temporary failures, checks the result is complete and consistent, and returns a plain list of records. Any failure becomes an `InventoryApiException`.
 - **`Aggregation/`**: `IInventoryAggregator` and its implementation. This is pure business logic: it takes records in and returns category summaries. It knows nothing about HTTP, async code, or configuration, so it can be tested on its own.
 - **`Endpoints/`**: the HTTP endpoint. It calls the client, passes the records to the aggregator, and turns an `InventoryApiException` into a `502` response. The handler is a plain static method returning typed results, so tests can call it directly without starting a web server.
 - The client is registered as a typed `HttpClient` through `IHttpClientFactory`. The base URL and the `x-api-key` header are applied once at registration, so the client class doesn't know where its configuration comes from.
+- Everything is wired together with dependency injection in `Program.cs`. The client, the aggregator and the clock (`TimeProvider`) are all registered there, which is what lets the tests swap in fakes.
+
+The main reason for the split is that the hard part of this task is getting a correct dataset from an unreliable API, while the aggregation itself is simple. Keeping all of the unreliable-API handling inside the client means the aggregator can assume clean input, and each part's tests only deal with one kind of problem.
 
 ## Decisions and observed API behaviour
 
@@ -140,7 +170,7 @@ The rules from the brief are implemented as written. Where the brief left someth
 
 - **Zero and negative quantities.** Records are kept only if `quantity > 0`. The brief says to exclude zero. Negative stock can't be real, so it's excluded too.
 - **Categories with no stock.** If every record in a category has zero quantity, the category doesn't appear in the output at all, since no records are left to describe it.
-- **Category names.** The real data spells the same category many ways, for example `"Toys"`, `"TOYS"`, `"toys"` and `"  toys "`. Without normalising, one category would be split into several groups with wrong totals, so grouping trims whitespace and ignores case. The category name shown in the output is the spelling used most often in the group (after trimming), with ties going to the alphabetically first spelling so the result is always the same. A blank or missing category is grouped as `"Uncategorized"`.
+- **Category names.** The real data spells the same category many ways, for example `"Toys"`, `"TOYS"`, `"toys"` and `"  toys "`. Without normalising, one category would be split into several groups with wrong totals, so grouping trims whitespace and ignores case. The category name shown in the output is the spelling used most often in the group (after trimming), with ties going to the first spelling in ordinal (character-code) order, which puts capitalised spellings first (`"Toys"` before `"toys"`). This keeps the result the same on every call. A blank or missing category is grouped as `"Uncategorized"`.
 - **Records keep their original category text.** The `items` list returns each record exactly as the API sent it, including its original category spelling. Only the grouping and the category name at the top of each summary are normalised.
 - **Ties for most recently updated.** If two records share the latest `lastUpdated`, the one with the lower `id` is chosen, so the result never depends on the order the API returned records in.
 - **Ordering.** Categories are sorted by name, and the records inside each category by `id`, so the response is identical on every call.
@@ -148,8 +178,29 @@ The rules from the brief are implemented as written. Where the brief left someth
 
 ## Assumptions and known limitations
 
-_TODO: will be completed at the end._ Noted so far:
+**Assumptions**
 
-- If the API keeps failing after all retries, or the data doesn't add up, the request fails as a whole with a `502`. No partial or cached results are returned.
-- The whole dataset is fetched again on every request. Nothing is cached, even though the dataset is described as static. Caching would be the first thing to add with more time.
-- Pages are fetched one after another, not in parallel. This is slower but avoids triggering more rate limiting.
+- A record's `id` identifies it uniquely. Two records with the same `id` are treated as copies of one record.
+- When copies of a record disagree, the one with the latest `lastUpdated` is the correct one. The brief doesn't say this; it's a judgement call (see "Completeness and duplicates").
+- Category spellings that differ only in case or surrounding whitespace refer to the same category.
+- The `totalRecords` the API reports is the true size of the dataset, so the completeness check compares against it.
+
+**Known limitations**
+
+- **All or nothing.** If the API keeps failing after all retries, or the data doesn't add up, the request fails as a whole with a `502`. No partial or cached results are returned. I think wrong-but-plausible inventory figures are worse than an honest error, but some callers might prefer partial data flagged as incomplete.
+- **No caching.** The whole dataset is fetched again on every request, even though the brief says it's static. A request can therefore be slow: one run waited 8 seconds on a single `Retry-After`.
+- **Sequential paging.** Pages are fetched one at a time, not in parallel. This is slower, but parallel requests would make rate limiting worse.
+- **Retry settings are fixed in code.** Attempts (4), base delay (0.5s) and maximum delay (10s) are constants rather than configuration.
+- **No overall time limit of our own.** Each HTTP call uses `HttpClient`'s default 100-second timeout, and retries add to that. In the worst case, a caller could wait a long time before getting the `502`.
+- **No integration test.** The tests cover each part in isolation. No automated test starts the whole app (for example with `WebApplicationFactory`) or calls the real API. The full flow was checked by hand against the live API.
+- **Our endpoint has no authentication.** Anyone who can reach the service can call it.
+
+## What I would do next
+
+In rough priority order:
+
+1. **Cache the aggregated result** (for example, `IMemoryCache` with an expiry) so most requests don't touch the upstream API, which also reduces rate limiting.
+2. **Add an overall request time limit**, so a caller gets an answer within a known time even if the upstream API is slow.
+3. **Add an integration test** with `WebApplicationFactory` and the fake handler, covering routing, JSON shape and the `502` from end to end.
+4. **Move the retry settings into configuration**, or swap the hand-written retries for `Microsoft.Extensions.Http.Resilience` if the service grows and needs circuit breaking too.
+5. **Return the `Z` timestamp format** if the brief's exact format matters to consumers.
