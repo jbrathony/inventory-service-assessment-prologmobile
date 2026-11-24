@@ -1,3 +1,4 @@
+using InventoryService.Api.Aggregation;
 using InventoryService.Api.Clients;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -20,6 +21,9 @@ builder.Services.AddHttpClient<IInventoryApiClient, InventoryApiClient>((sp, htt
         ?? throw new InvalidOperationException("Inventory:ApiKey is not configured.");
     http.DefaultRequestHeaders.Add("x-api-key", apiKey);
 });
+
+// The aggregator holds no state, so one shared instance is enough.
+builder.Services.AddSingleton<IInventoryAggregator, InventoryAggregator>();
 
 var app = builder.Build();
 

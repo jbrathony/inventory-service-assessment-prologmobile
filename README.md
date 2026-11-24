@@ -2,7 +2,7 @@
 
 A small .NET service that reads every inventory record from the Inventory API (which is paginated and not always well behaved), aggregates them by category, and exposes the result over HTTP.
 
-> **Status:** work in progress. The API client is done. Aggregation, the final endpoint, and tests are still to come, and the sections marked _TODO_ will be filled in as they're built.
+> **Status:** work in progress. The API client and the aggregation logic are done. The final endpoint and tests are still to come, and the sections marked _TODO_ will be filled in as they're built.
 
 ## Requirements
 
@@ -49,6 +49,7 @@ _TODO: full write-up once all the pieces exist._ So far:
 
 - **`Models/`**: immutable `record` types for an inventory record and for one page of API results.
 - **`Clients/`**: `IInventoryApiClient` and its implementation. This is the only code that knows HTTP exists. It fetches every page, retries temporary failures, checks the result is complete and consistent, and returns a plain list of records. Any failure becomes an `InventoryApiException`.
+- **`Aggregation/`**: `IInventoryAggregator` and its implementation. This is pure business logic: it takes records in and returns category summaries. It knows nothing about HTTP, async code, or configuration, so it can be tested on its own.
 - The client is registered as a typed `HttpClient` through `IHttpClientFactory`. The base URL and the `x-api-key` header are applied once at registration, so the client class doesn't know where its configuration comes from.
 
 ## Decisions and observed API behaviour
@@ -76,11 +77,21 @@ Delays go through an injected `TimeProvider`, so tests can fake the clock instea
 ### Completeness and duplicates
 A successful 200 response doesn't guarantee correct data, so the client checks what it collected:
 
-- **Duplicates across pages.** One run collected **160** records when the API reported `totalRecords = 157`. The logs showed **3 duplicate records**, and all of them were **identical copies**: no copies of the same `id` disagreed. The same record had appeared on more than one page. Records are de-duplicated by `id`:
+- **Duplicates across pages.** One run collected **160** records when the API reported `totalRecords = 157`, because 3 records appeared on more than one page. All 3 were **identical copies**; no copies of the same `id` disagreed. Records are de-duplicated by `id`:
   - Identical copies are collapsed into one.
   - If copies of the same `id` disagree, the copy with the latest `lastUpdated` is kept (taken to be the freshest version) and a warning is logged. This is a judgement call: the API docs don't say which copy is correct.
 - **Completeness.** After de-duplication, the number of unique records must equal `totalRecords`. If it doesn't, the request fails instead of returning partial data. Inventory figures built from incomplete data would look correct while being wrong.
 - **Consistency.** `totalRecords` must be the same on every page. If it changes partway through the fetch, the request fails.
+
+### Aggregation
+The rules from the brief are implemented as written. Where the brief left something open, these are the choices made:
+
+- **Zero and negative quantities.** Records are kept only if `quantity > 0`. The brief says to exclude zero. Negative stock can't be real, so it's excluded too.
+- **Categories with no stock.** If every record in a category has zero quantity, the category doesn't appear in the output at all, since no records are left to describe it.
+- **Category names.** Grouping trims whitespace and ignores case, so `"Electronics"` and `"electronics "` are one category. The name shown is the trimmed spelling of the first record seen in that group. A blank or missing category is grouped as `"Uncategorized"`. The brief says every record has exactly one category, so these are only safeguards.
+- **Ties for most recently updated.** If two records share the latest `lastUpdated`, the one with the lower `id` is chosen, so the result never depends on the order the API returned records in.
+- **Ordering.** Categories are sorted by name, and the records inside each category by `id`, so the response is identical on every call.
+- **Money.** Totals are `decimal` and are not rounded. Prices have at most two decimal places and quantities are whole numbers, so the totals are already exact.
 
 ## Assumptions and known limitations
 
