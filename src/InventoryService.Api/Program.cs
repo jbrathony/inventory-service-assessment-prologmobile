@@ -1,5 +1,6 @@
 using InventoryService.Api.Aggregation;
 using InventoryService.Api.Clients;
+using InventoryService.Api.Endpoints;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -25,14 +26,16 @@ builder.Services.AddHttpClient<IInventoryApiClient, InventoryApiClient>((sp, htt
 // The aggregator holds no state, so one shared instance is enough.
 builder.Services.AddSingleton<IInventoryAggregator, InventoryAggregator>();
 
+// Errors are returned as standard "problem details" JSON (RFC 9457).
+builder.Services.AddProblemDetails();
+
 var app = builder.Build();
 
-// TEMPORARY smoke-test endpoint: proves we can reach the API and page
-// through every record. We'll replace it with the real aggregated endpoint.
-app.MapGet("/api/records-count", async (IInventoryApiClient client, CancellationToken ct) =>
-{
-    var records = await client.GetAllRecordsAsync(ct);
-    return Results.Ok(new { count = records.Count });
-});
+// Safety net: any exception we didn't expect becomes a plain 500 problem response,
+// with no stack trace sent to the caller.
+app.UseExceptionHandler();
+app.UseStatusCodePages();
+
+app.MapInventoryEndpoints();
 
 app.Run();

@@ -38,12 +38,24 @@ public class InventoryAggregator : IInventoryAggregator
             .First();
 
         return new CategorySummary(
-            Category: group.Key,
+            Category: DisplayName(items),
             TotalInventoryValue: items.Sum(r => r.Price * r.Quantity), // Rule 3
             AvailableRecordCount: items.Count,                          // Rule 4
             MostRecentlyUpdated: new RecordReference(newest.Id, newest.Name, newest.LastUpdated),
             Items: items);
     }
+
+    // The API spells the same category several ways ("Toys", "TOYS", "  toys ").
+    // Show the spelling used most often in the group; ties go to the
+    // alphabetically first one so the result is always the same.
+    private static string DisplayName(IEnumerable<InventoryRecord> items) =>
+        items
+            .Select(r => NormaliseCategory(r.Category))
+            .GroupBy(name => name, StringComparer.Ordinal)
+            .OrderByDescending(spelling => spelling.Count())
+            .ThenBy(spelling => spelling.Key, StringComparer.Ordinal)
+            .First()
+            .Key;
 
     private static string NormaliseCategory(string? category) =>
         string.IsNullOrWhiteSpace(category) ? UncategorizedLabel : category.Trim();

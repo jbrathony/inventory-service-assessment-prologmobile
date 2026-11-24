@@ -2,7 +2,7 @@
 
 A small .NET service that reads every inventory record from the Inventory API (which is paginated and not always well behaved), aggregates them by category, and exposes the result over HTTP.
 
-> **Status:** work in progress. The API client and the aggregation logic are done. The final endpoint and tests are still to come, and the sections marked _TODO_ will be filled in as they're built.
+> **Status:** work in progress. The API client, the aggregation logic and the endpoint are done. Tests are still to come, and the sections marked _TODO_ will be filled in as they're built.
 
 ## Requirements
 
@@ -35,9 +35,60 @@ The app listens on `http://localhost:5104`.
 
 ## Endpoint
 
-_TODO: the aggregated endpoint is not built yet._
+```
+GET http://localhost:5104/api/inventory/categories
+```
 
-Right now there's a temporary check endpoint, `GET /api/records-count`. It fetches every page and returns how many unique records were collected. It will be replaced by the aggregated endpoint.
+### Success: `200 OK`
+
+```json
+{
+  "categories": [
+    {
+      "category": "Electronics",
+      "totalInventoryValue": 1799.88,
+      "availableRecordCount": 1,
+      "mostRecentlyUpdated": {
+        "id": 1001,
+        "name": "Thermal Receipt Printer",
+        "lastUpdated": "2026-10-15T12:30:00+00:00"
+      },
+      "items": [
+        {
+          "id": 1001,
+          "name": "Thermal Receipt Printer",
+          "category": "Electronics",
+          "price": 149.99,
+          "quantity": 12,
+          "lastUpdated": "2026-10-15T12:30:00+00:00"
+        }
+      ]
+    }
+  ]
+}
+```
+
+The shape follows the example in the brief. There are two small differences:
+
+- Each item also includes its `category`. Every item is returned exactly as the Inventory API sent it, so nothing is silently dropped.
+- Timestamps are written as `+00:00` rather than `Z` (confirmed against the live output). Both are valid ISO 8601 for UTC; this is how .NET writes `DateTimeOffset` by default.
+
+### Failure: `502 Bad Gateway`
+
+If the Inventory API can't be reached, keeps failing after retries, or returns data that fails the completeness checks, the endpoint returns a standard problem-details body instead of partial data:
+
+```json
+{
+  "type": "https://tools.ietf.org/html/rfc9110#section-15.6.3",
+  "title": "Inventory data is unavailable",
+  "status": 502,
+  "detail": "The upstream inventory service failed or returned incomplete data. Please try again later."
+}
+```
+
+The caller gets a generic message. The specific cause (for example, "returned 429 on page 6 after 4 attempts") is written to the server log, so internal details aren't exposed.
+
+`502` was chosen because the problem lies with the service we depend on, not with the caller's request or our own code. Any other unexpected error returns a plain `500` problem response with no stack trace.
 
 ## Running the tests
 
@@ -50,6 +101,7 @@ _TODO: full write-up once all the pieces exist._ So far:
 - **`Models/`**: immutable `record` types for an inventory record and for one page of API results.
 - **`Clients/`**: `IInventoryApiClient` and its implementation. This is the only code that knows HTTP exists. It fetches every page, retries temporary failures, checks the result is complete and consistent, and returns a plain list of records. Any failure becomes an `InventoryApiException`.
 - **`Aggregation/`**: `IInventoryAggregator` and its implementation. This is pure business logic: it takes records in and returns category summaries. It knows nothing about HTTP, async code, or configuration, so it can be tested on its own.
+- **`Endpoints/`**: the HTTP endpoint. It calls the client, passes the records to the aggregator, and turns an `InventoryApiException` into a `502` response. The handler is a plain static method returning typed results, so tests can call it directly without starting a web server.
 - The client is registered as a typed `HttpClient` through `IHttpClientFactory`. The base URL and the `x-api-key` header are applied once at registration, so the client class doesn't know where its configuration comes from.
 
 ## Decisions and observed API behaviour
@@ -88,7 +140,8 @@ The rules from the brief are implemented as written. Where the brief left someth
 
 - **Zero and negative quantities.** Records are kept only if `quantity > 0`. The brief says to exclude zero. Negative stock can't be real, so it's excluded too.
 - **Categories with no stock.** If every record in a category has zero quantity, the category doesn't appear in the output at all, since no records are left to describe it.
-- **Category names.** Grouping trims whitespace and ignores case, so `"Electronics"` and `"electronics "` are one category. The name shown is the trimmed spelling of the first record seen in that group. A blank or missing category is grouped as `"Uncategorized"`. The brief says every record has exactly one category, so these are only safeguards.
+- **Category names.** The real data spells the same category many ways, for example `"Toys"`, `"TOYS"`, `"toys"` and `"  toys "`. Without normalising, one category would be split into several groups with wrong totals, so grouping trims whitespace and ignores case. The category name shown in the output is the spelling used most often in the group (after trimming), with ties going to the alphabetically first spelling so the result is always the same. A blank or missing category is grouped as `"Uncategorized"`.
+- **Records keep their original category text.** The `items` list returns each record exactly as the API sent it, including its original category spelling. Only the grouping and the category name at the top of each summary are normalised.
 - **Ties for most recently updated.** If two records share the latest `lastUpdated`, the one with the lower `id` is chosen, so the result never depends on the order the API returned records in.
 - **Ordering.** Categories are sorted by name, and the records inside each category by `id`, so the response is identical on every call.
 - **Money.** Totals are `decimal` and are not rounded. Prices have at most two decimal places and quantities are whole numbers, so the totals are already exact.
@@ -97,6 +150,6 @@ The rules from the brief are implemented as written. Where the brief left someth
 
 _TODO: will be completed at the end._ Noted so far:
 
-- If the API keeps failing after all retries, or the data doesn't add up, the request fails as a whole. No partial or cached results are returned.
+- If the API keeps failing after all retries, or the data doesn't add up, the request fails as a whole with a `502`. No partial or cached results are returned.
 - The whole dataset is fetched again on every request. Nothing is cached, even though the dataset is described as static. Caching would be the first thing to add with more time.
 - Pages are fetched one after another, not in parallel. This is slower but avoids triggering more rate limiting.
